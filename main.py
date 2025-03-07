@@ -13,6 +13,15 @@ logging.basicConfig(
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
+def convert_file_size(num_bytes):
+    """
+    Convert a file size in bytes to a more readable string like '123 KB'.
+    """
+    for unit in ['B','KB','MB','GB','TB']:
+        if num_bytes < 1024:
+            return f"{num_bytes:.0f} {unit}"
+        num_bytes /= 1024
+    return f"{num_bytes:.0f} PB"
 
 def copy_and_resize_image(original_path: Path, local_image_path: Path, max_size=(300, 300)):
     """
@@ -20,7 +29,7 @@ def copy_and_resize_image(original_path: Path, local_image_path: Path, max_size=
     Returns the local thumbnail path if successful, or None if failed.
     """
     try:
-        # Only regenerate the thumbnail if the original is newer or if the thumbnail doesn't exist
+        # Only regenerate if original is newer or thumbnail doesn't exist
         if (not local_image_path.exists() or
                 original_path.stat().st_mtime > local_image_path.stat().st_mtime):
             with Image.open(original_path) as img:
@@ -40,7 +49,6 @@ def copy_and_resize_image(original_path: Path, local_image_path: Path, max_size=
 
     return None
 
-
 def copy_and_resize_images(catalog, img_folder: Path, max_size=(300, 300), max_workers=4):
     """
     For each image in the catalog, create a thumbnail in `img` folder.
@@ -56,51 +64,48 @@ def copy_and_resize_images(catalog, img_folder: Path, max_size=(300, 300), max_w
             for creator, releases in creators.items():
                 for release, models in releases.items():
                     for model_name, data in models.items():
-                        # The 'images_original' list is the full-sized paths
-                        # The 'images_thumbs' list will hold the thumbnail paths
+                        # We'll store the original/thumbnail pairs separately
                         data.setdefault("images_original", [])
                         data.setdefault("images_thumbs", [])
 
-                        # We move anything from "images" into "images_original"
-                        # so we maintain them side-by-side
-                        if "images" in data:
-                            # In case we haven’t already set them aside
-                            for img_path in data["images"]:
-                                original_path = Path(img_path)
-                                if original_path.exists() and original_path.is_file():
-                                    # Schedule thumbnail creation
-                                    local_image_path = img_folder / original_path.name
-                                    future = executor.submit(
-                                        copy_and_resize_image,
-                                        original_path,
-                                        local_image_path,
-                                        max_size
-                                    )
-                                    # Map the future to (model, original image path)
-                                    future_to_meta[future] = (data, original_path)
-                            # Clear out "images" to avoid confusion
-                            data["images"] = []
+                        # Anything in "images" will be processed for thumbnails
+                        for img_entry in data["images"]:
+                            original_path = Path(img_entry["path"])
+                            if original_path.exists() and original_path.is_file():
+                                local_image_path = img_folder / original_path.name
+                                future = executor.submit(
+                                    copy_and_resize_image,
+                                    original_path,
+                                    local_image_path,
+                                    max_size
+                                )
+                                # Map the future to (data, original_path)
+                                future_to_meta[future] = (data, original_path)
 
-    # Gather the results for the thumbnails
+                        # Clear out "images" so we don't double-process
+                        data["images"] = []
+
+    # Gather thumbnail results
     for future in as_completed(future_to_meta):
         data, original_path = future_to_meta[future]
         thumb_path = future.result()
         if thumb_path:
-            # Store both the original path and thumbnail path
             data["images_original"].append(str(original_path))
             data["images_thumbs"].append(thumb_path)
 
-
 def scan_directories(base_paths):
     """
-    Scans multiple directories recursively, categorizing STL-related files.
-    We use the folder structure to guess Creator -> Release -> Model,
-    but we also do some special cases:
-      - If a file is .zip, we force 'release' = 'Zip'.
-      - .lys / .chitubox = slicer files
-      - .stl = typical 3D model
-      - .jpg / .png = images
-      - If we can't determine a model name, use the folder name.
+    Scans multiple directories recursively, building a nested structure:
+      catalog[base_path][creator][release][model] = {
+          "slicer_files": [ {path, size, ext}, ... ],
+          "stl_files":    [ {path, size, ext}, ... ],
+          "files":        [ {path, size, ext}, ... ],
+          "images":       [ {path, size, ext}, ... ]
+      }
+
+    - If .zip, put in a "Zip" release category.
+    - We also store file size and extension for icons/UX improvements later.
+    - If we don't have enough folder depth to guess a "model", we just use the folder's name.
     """
     catalog = {}
 
@@ -113,23 +118,15 @@ def scan_directories(base_paths):
             relative_path = root_path.relative_to(base_path)
             parts = relative_path.parts
 
-            # Attempt to pick out the "creator", "release", "model"
-            # If we don't have enough directory depth, we default in a safe way.
-            if len(parts) < 1:
+            if len(parts) == 0:
                 creator = "Misc Files"
                 release = ""
                 model_name = root_path.name
             else:
                 creator = parts[0] if len(parts) >= 1 else "Misc Files"
-                # By default, release is the second part if it exists, else "Unknown Release"
                 release = parts[1] if len(parts) >= 2 else "Unknown Release"
-                # For model name, if we don't have 3+ parts, fallback to the folder's name
-                if len(parts) >= 3:
-                    model_name = parts[-1]
-                else:
-                    model_name = root_path.name
+                model_name = parts[-1] if len(parts) >= 3 else root_path.name
 
-            # Ensure the base path is in the catalog
             if base_path_str not in catalog:
                 catalog[base_path_str] = {}
             if creator not in catalog[base_path_str]:
@@ -138,20 +135,19 @@ def scan_directories(base_paths):
                 catalog[base_path_str][creator][release] = {}
             if model_name not in catalog[base_path_str][creator][release]:
                 catalog[base_path_str][creator][release][model_name] = {
-                    "stl_files": [],
                     "slicer_files": [],
-                    "files": [],  # For "other" stuff
+                    "stl_files": [],
+                    "files": [],
                     "images": []
                 }
 
             print(f"Scanning folder: {relative_path}")
-            # Now categorize each file in the current folder
             for filename in files:
                 file_path = root_path / filename
                 if not file_path.is_file():
                     continue
-
                 ext = file_path.suffix.lower().lstrip('.')
+                size_str = convert_file_size(file_path.stat().st_size)
 
                 # If it's a .zip, override the release to "Zip"
                 if ext == "zip":
@@ -160,36 +156,52 @@ def scan_directories(base_paths):
                         catalog[base_path_str][creator][release_key] = {}
                     if model_name not in catalog[base_path_str][creator][release_key]:
                         catalog[base_path_str][creator][release_key][model_name] = {
-                            "stl_files": [],
                             "slicer_files": [],
+                            "stl_files": [],
                             "files": [],
                             "images": []
                         }
-                    # Insert .zip file as a normal "file"
-                    catalog[base_path_str][creator][release_key][model_name]["files"].append(str(file_path))
+                    catalog[base_path_str][creator][release_key][model_name]["files"].append({
+                        "path": str(file_path),
+                        "size": size_str,
+                        "ext": ext
+                    })
 
                 elif ext in ["jpg", "jpeg", "png"]:
-                    catalog[base_path_str][creator][release][model_name]["images"].append(str(file_path))
+                    catalog[base_path_str][creator][release][model_name]["images"].append({
+                        "path": str(file_path),
+                        "size": size_str,
+                        "ext": ext
+                    })
 
                 elif ext in ["lys", "chitubox"]:
-                    catalog[base_path_str][creator][release][model_name]["slicer_files"].append(str(file_path))
+                    catalog[base_path_str][creator][release][model_name]["slicer_files"].append({
+                        "path": str(file_path),
+                        "size": size_str,
+                        "ext": ext
+                    })
 
                 elif ext in ["stl"]:
-                    catalog[base_path_str][creator][release][model_name]["stl_files"].append(str(file_path))
+                    catalog[base_path_str][creator][release][model_name]["stl_files"].append({
+                        "path": str(file_path),
+                        "size": size_str,
+                        "ext": ext
+                    })
 
                 else:
-                    # Catch-all for other stuff
-                    catalog[base_path_str][creator][release][model_name]["files"].append(str(file_path))
+                    catalog[base_path_str][creator][release][model_name]["files"].append({
+                        "path": str(file_path),
+                        "size": size_str,
+                        "ext": ext
+                    })
 
     print("Directory scan complete.")
     return catalog
 
-
 def remove_empty_entries(catalog: dict) -> dict:
     """
-    Removes empty models, releases, creators, and base_paths
-    from the catalog structure in-place.
-    Returns the pruned catalog reference.
+    Removes empty models, releases, creators, and base_paths from the structure.
+    Returns the pruned catalog.
     """
     empty_base_paths = []
     for base_path, creators in catalog.items():
@@ -200,14 +212,14 @@ def remove_empty_entries(catalog: dict) -> dict:
             for release, models in releases.items():
                 empty_models = []
                 for model, data in models.items():
-                    # Check if this model is truly empty
-                    # i.e. no stl_files, no images, no slicer_files, no "files"
-                    if (not data["stl_files"] and
-                            not data["slicer_files"] and
-                            not data["images"] and
-                            not data["files"] and
-                            not data.get("images_original") and
-                            not data.get("images_thumbs")):
+                    # check if everything is empty
+                    no_stls = not data["stl_files"]
+                    no_slicers = not data["slicer_files"]
+                    no_images = not data["images"]
+                    no_files = not data["files"]
+                    no_images_orig = not data.get("images_original")
+                    no_images_thumbs = not data.get("images_thumbs")
+                    if all([no_stls, no_slicers, no_images, no_files, no_images_orig, no_images_thumbs]):
                         empty_models.append(model)
 
                 for em in empty_models:
@@ -233,16 +245,15 @@ def remove_empty_entries(catalog: dict) -> dict:
 
     return catalog
 
-
 def generate_html(catalog, output_file: Path):
     """
-    Generates an HTML file displaying the categorized STL models
-    using Bootstrap 5. For each model, we show:
-      - Prefer slicer files, displayed first.
-      - Then STL files.
-      - Then 'other' files
-      - Thumbnails (click to open full image in new window).
-      - A link to open the containing folder instead of the individual file.
+    Generates an HTML file with:
+     - Sorted base_path, creators, releases, models
+     - Filetype icons (Bootstrap Icons)
+     - Lightbox-style modal for images
+     - File sizes
+     - Client-side search
+     - Toggle Thumbnails button
     """
 
     template_str = r"""
@@ -253,11 +264,15 @@ def generate_html(catalog, output_file: Path):
     <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
     <title>STL Catalog</title>
 
-    <!-- Bootstrap 5 CSS -->
+    <!-- Bootstrap CSS -->
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css"
           rel="stylesheet"
           integrity="sha384-QWTKZyjpPEjISv5WaRU9OFeRpok6YctnYmDr5pNlyT2bRjXh0JMhjY6hW+ALEwIH"
           crossorigin="anonymous">
+    <!-- Bootstrap Icons -->
+    <link rel="stylesheet"
+          href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.5/font/bootstrap-icons.css">
+
     <style>
         .model img {
             margin-right: 10px;
@@ -271,6 +286,10 @@ def generate_html(catalog, output_file: Path):
         .file-list {
             margin-top: 0.5rem;
         }
+        /* For toggling thumbnail containers on/off */
+        .thumbnails-container {
+            transition: 0.3s ease;
+        }
         /* Floating Back to Top Button */
         #backToTopBtn {
             display: none;
@@ -279,21 +298,38 @@ def generate_html(catalog, output_file: Path):
             right: 40px;
             z-index: 99;
         }
+        /* Hide elements not matching search */
+        .hidden-by-search {
+            display: none !important;
+        }
     </style>
 </head>
 <body class="bg-light">
     <div class="container my-5">
         <h1 class="mb-4">STL Catalog</h1>
 
-        <!-- Collapse All button -->
-        <button onclick="collapseAllAccordions()" class="btn btn-outline-secondary mb-4">
-            Collapse All
-        </button>
+        <!-- Search Field -->
+        <div class="mb-3">
+            <label for="searchInput" class="form-label">Search:</label>
+            <input type="text" id="searchInput" class="form-control"
+                   placeholder="Type to filter... (model, release, creator, or base path)">
+        </div>
+
+        <!-- Buttons -->
+        <div class="d-flex gap-2 mb-4">
+            <button onclick="collapseAllAccordions()" class="btn btn-outline-secondary">
+                Collapse All
+            </button>
+            <button onclick="toggleThumbnails()" class="btn btn-outline-secondary" id="toggleThumbsBtn">
+                Hide Thumbnails
+            </button>
+        </div>
 
         <!-- Outer accordion for Base Directories -->
         <div class="accordion" id="accordionBaseDirs">
-            {% for base_path, creators in catalog.items() %}
-            <div class="accordion-item">
+            {% for base_path, creators in catalog|dictsort %}
+            <div class="accordion-item" 
+                 data-filter-text="{{ base_path|lower }}">
                 <h2 class="accordion-header" id="heading-{{ loop.index }}">
                     <button class="accordion-button collapsed"
                             type="button"
@@ -312,8 +348,9 @@ def generate_html(catalog, output_file: Path):
 
                         <!-- Nested accordion for Creators -->
                         <div class="accordion" id="accordionCreators-{{ loop.index }}">
-                            {% for creator, releases in creators.items() %}
-                            <div class="accordion-item">
+                            {% for creator, releases in creators|dictsort %}
+                            <div class="accordion-item"
+                                 data-filter-text="{{ creator|lower }} {{ base_path|lower }}">
                                 <h2 class="accordion-header" id="heading-{{ loop.index }}-{{ loop.index0 }}">
                                     <button class="accordion-button collapsed"
                                             type="button"
@@ -332,8 +369,9 @@ def generate_html(catalog, output_file: Path):
 
                                         <!-- Another accordion for Releases -->
                                         <div class="accordion" id="accordionReleases-{{ loop.index }}-{{ loop.index0 }}">
-                                            {% for release, models in releases.items() %}
-                                            <div class="accordion-item">
+                                            {% for release, models in releases|dictsort %}
+                                            <div class="accordion-item"
+                                                 data-filter-text="{{ release|lower }} {{ creator|lower }} {{ base_path|lower }}">
                                                 <h2 class="accordion-header"
                                                     id="heading-{{ loop.index }}-{{ loop.index0 }}-{{ loop.index1 }}">
                                                     <button class="accordion-button collapsed"
@@ -350,56 +388,66 @@ def generate_html(catalog, output_file: Path):
                                                      aria-labelledby="heading-{{ loop.index }}-{{ loop.index0 }}-{{ loop.index1 }}"
                                                      data-bs-parent="#accordionReleases-{{ loop.index }}-{{ loop.index0 }}">
                                                     <div class="accordion-body">
+
                                                         <!-- Models Listing -->
-                                                        {% for model, data in models.items() %}
-                                                        <div class="model mb-3">
-                                                            <h5 class="fw-bold">{{ model }}</h5>
+                                                        {% for model_name, data in models|dictsort %}
+                                                        <div class="model mb-3"
+                                                             data-filter-text="{{ model_name|lower }} {{ release|lower }} {{ creator|lower }} {{ base_path|lower }}">
+                                                            <h5 class="fw-bold">{{ model_name }}</h5>
                                                             <div class="file-list">
                                                                 <p class="text-muted mb-1">Files:</p>
                                                                 <ul class="list-unstyled">
-                                                                    <!-- Show slicer files first -->
-                                                                    {% for s in data.get("slicer_files", []) %}
-                                                                    <li class="slicer-file">
-                                                                        <!-- Link to open folder instead of the file -->
-                                                                        <a href="file://{{ s|dirname }}"
+
+                                                                    <!-- Slicer files first -->
+                                                                    {% for slicer in data.get("slicer_files", []) %}
+                                                                    <li class="slicer-file d-flex align-items-center">
+                                                                        <i class="bi {{ slicer.ext|file_icon }} me-1"></i>
+                                                                        <a href="file://{{ slicer.path|dirname }}"
                                                                            target="_blank">
                                                                             [Open Folder]
                                                                         </a>
-                                                                        - {{ s }}
+                                                                        - {{ slicer.path }} ({{ slicer.size }})
                                                                     </li>
                                                                     {% endfor %}
 
                                                                     <!-- Then STL files -->
                                                                     {% for stl in data.get("stl_files", []) %}
-                                                                    <li>
-                                                                        <a href="file://{{ stl|dirname }}"
+                                                                    <li class="d-flex align-items-center">
+                                                                        <i class="bi {{ stl.ext|file_icon }} me-1"></i>
+                                                                        <a href="file://{{ stl.path|dirname }}"
                                                                            target="_blank">
                                                                             [Open Folder]
                                                                         </a>
-                                                                        - {{ stl }}
+                                                                        - {{ stl.path }} ({{ stl.size }})
                                                                     </li>
                                                                     {% endfor %}
 
-                                                                    <!-- Then general 'other' files -->
+                                                                    <!-- Then general "other" files -->
                                                                     {% for f in data.get("files", []) %}
-                                                                    <li>
-                                                                        <a href="file://{{ f|dirname }}"
+                                                                    <li class="d-flex align-items-center">
+                                                                        <i class="bi {{ f.ext|file_icon }} me-1"></i>
+                                                                        <a href="file://{{ f.path|dirname }}"
                                                                            target="_blank">
                                                                             [Open Folder]
                                                                         </a>
-                                                                        - {{ f }}
+                                                                        - {{ f.path }} ({{ f.size }})
                                                                     </li>
                                                                     {% endfor %}
                                                                 </ul>
                                                             </div>
-                                                            <div>
-                                                                <!-- Image thumbnails that link to full-size images -->
+
+                                                            <!-- Thumbnails Container -->
+                                                            <div class="thumbnails-container">
                                                                 {% for i in range(data.get("images_thumbs", [])|length) %}
                                                                     {% set thumb = data.images_thumbs[i] %}
                                                                     {% set orig = data.images_original[i] %}
-                                                                    <a href="file://{{ orig }}" target="_blank">
-                                                                        <img src="{{ thumb }}" width="150" loading="lazy" class="border">
-                                                                    </a>
+                                                                    <img  src="{{ thumb }}"
+                                                                          alt="thumbnail"
+                                                                          class="border catalog-thumbnail"
+                                                                          width="150"
+                                                                          loading="lazy"
+                                                                          data-fullsize="{{ orig }}"
+                                                                          style="cursor:pointer;">
                                                                 {% endfor %}
                                                             </div>
                                                         </div>
@@ -422,6 +470,19 @@ def generate_html(catalog, output_file: Path):
             {% endfor %}
         </div> <!-- End accordionBaseDirs -->
     </div> <!-- container -->
+
+    <!-- Modal for Lightbox -->
+    <div class="modal fade" id="imageModal" tabindex="-1" aria-labelledby="imageModalLabel" aria-hidden="true">
+      <div class="modal-dialog modal-dialog-centered modal-xl">
+        <div class="modal-content">
+          <div class="modal-body p-0" style="text-align:center;">
+            <img id="modal-img" src="" alt="" style="max-width: 100%; height:auto;">
+          </div>
+          <button type="button" class="btn-close position-absolute top-0 end-0 p-3"
+                  data-bs-dismiss="modal" aria-label="Close"></button>
+        </div>
+      </div>
+    </div>
 
     <!-- Back to Top Button -->
     <button id="backToTopBtn" class="btn btn-primary" title="Go to top" onclick="topFunction()">
@@ -457,24 +518,78 @@ def generate_html(catalog, output_file: Path):
                 bsCollapse.hide();
             });
         }
+
+        // Toggle show/hide all thumbnail containers
+        let thumbsAreVisible = true;
+        function toggleThumbnails() {
+            const thumbBtn = document.getElementById("toggleThumbsBtn");
+            const containers = document.querySelectorAll('.thumbnails-container');
+            thumbsAreVisible = !thumbsAreVisible;
+            containers.forEach(el => {
+                el.style.display = thumbsAreVisible ? '' : 'none';
+            });
+            thumbBtn.textContent = thumbsAreVisible ? 'Hide Thumbnails' : 'Show Thumbnails';
+        }
+
+        // Lightbox (modal) for images
+        document.addEventListener('click', function(e) {
+            if (e.target.matches('.catalog-thumbnail')) {
+                const fullSizeUrl = e.target.dataset.fullsize;
+                const modalImg = document.getElementById('modal-img');
+                modalImg.src = "file://" + fullSizeUrl;
+                const imageModal = new bootstrap.Modal(document.getElementById('imageModal'));
+                imageModal.show();
+            }
+        });
+
+        // Client-side search
+        const searchInput = document.getElementById('searchInput');
+        searchInput.addEventListener('input', function() {
+            const query = searchInput.value.toLowerCase().trim();
+            // We want to hide .accordion-item or .model that doesn't match
+            // We'll match on the data-filter-text attribute which includes base_path/creator/release/model
+            const filterableEls = document.querySelectorAll('.accordion-item, .model');
+            filterableEls.forEach(el => {
+                const text = el.getAttribute('data-filter-text') || '';
+                if (text.includes(query)) {
+                    el.classList.remove('hidden-by-search');
+                } else {
+                    el.classList.add('hidden-by-search');
+                }
+            });
+        });
     </script>
 </body>
 </html>
     """
 
-    # We use a small Jinja2 Environment to define a custom filter for "dirname"
+    # We'll define a small dictionary for icons keyed by extension
+    file_icons = {
+        "zip": "bi-file-earmark-zip-fill",
+        "stl": "bi-file-earmark",
+        "lys": "bi-file-binary-fill",
+        "chitubox": "bi-file-binary-fill",
+        "jpg": "bi-file-image",
+        "jpeg": "bi-file-image",
+        "png": "bi-file-image"
+    }
+
+    def file_icon_filter(ext):
+        return file_icons.get(ext.lower(), "bi-file-earmark")
+
+    # Jinja environment with custom filters
     env = Environment()
     env.filters["dirname"] = lambda path_str: str(Path(path_str).parent)
+    env.filters["file_icon"] = file_icon_filter
 
     template = env.from_string(template_str)
     html_content = template.render(catalog=catalog)
     output_file.write_text(html_content, encoding="utf-8")
     print(f"HTML catalog generated: {output_file}")
 
-
 def main():
     """
-    Main function to execute the directory scan, resize images, and generate the HTML catalog.
+    Main function to run the directory scan, copy/resize images, and generate the HTML catalog.
     """
     base_paths_input = input("Enter the paths to your STL collections (comma-separated): ").strip()
     base_paths = [p.strip() for p in base_paths_input.split(',')]
@@ -483,17 +598,10 @@ def main():
 
     print("Starting STL catalog generation...")
     catalog = scan_directories(base_paths)
-    catalog = remove_empty_entries(catalog)
+    remove_empty_entries(catalog)
     copy_and_resize_images(catalog, img_folder)
-    # Generate HTML
     generate_html(catalog, output_file)
-
-    # If you want to run twice as in the original for safety, you can do so:
-    # copy_and_resize_images(catalog, img_folder)
-    # generate_html(catalog, output_file)
-
     print("Process completed successfully!")
-
 
 if __name__ == "__main__":
     main()
